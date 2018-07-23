@@ -39,6 +39,7 @@ package org.deegree.services.wfs;
 import static javax.xml.stream.XMLStreamConstants.END_ELEMENT;
 import static javax.xml.stream.XMLStreamConstants.START_ELEMENT;
 import static org.deegree.commons.ows.exception.OWSException.INVALID_PARAMETER_VALUE;
+import static org.deegree.commons.ows.exception.OWSException.INVALID_VALUE;
 import static org.deegree.commons.ows.exception.OWSException.MISSING_PARAMETER_VALUE;
 import static org.deegree.commons.ows.exception.OWSException.NO_APPLICABLE_CODE;
 import static org.deegree.commons.ows.exception.OWSException.OPERATION_NOT_SUPPORTED;
@@ -97,6 +98,7 @@ import org.deegree.feature.FeatureCollection;
 import org.deegree.feature.GenericFeatureCollection;
 import org.deegree.feature.persistence.FeatureStore;
 import org.deegree.feature.persistence.FeatureStoreException;
+import org.deegree.feature.persistence.FeatureStoreGMLIdResolver;
 import org.deegree.feature.persistence.FeatureStoreTransaction;
 import org.deegree.feature.persistence.lock.Lock;
 import org.deegree.feature.persistence.lock.LockManager;
@@ -108,6 +110,7 @@ import org.deegree.filter.Filter;
 import org.deegree.filter.Filters;
 import org.deegree.filter.IdFilter;
 import org.deegree.filter.OperatorFilter;
+import org.deegree.filter.expression.ValueReference;
 import org.deegree.geometry.GeometryFactory;
 import org.deegree.geometry.validation.CoordinateValidityInspector;
 import org.deegree.gml.GMLInputFactory;
@@ -115,6 +118,7 @@ import org.deegree.gml.GMLStreamReader;
 import org.deegree.gml.GMLVersion;
 import org.deegree.gml.feature.GMLFeatureReader;
 import org.deegree.gml.reference.FeatureReference;
+import org.deegree.gml.reference.matcher.ReferencePatternMatcher;
 import org.deegree.protocol.wfs.transaction.ReleaseAction;
 import org.deegree.protocol.wfs.transaction.Transaction;
 import org.deegree.protocol.wfs.transaction.TransactionAction;
@@ -169,24 +173,27 @@ class TransactionHandler {
 
     private final IDGenMode idGenMode;
 
+    private final boolean allowFeatureReferencesToDatastore;
+
     /**
      * Creates a new {@link TransactionHandler} instance that uses the given service to lookup requested
      * {@link FeatureType}s.
-     * 
-     * @param master
-     * 
+     *  @param master
+     *
      * @param service
      *            WFS instance used to lookup the feature types
      * @param request
-     *            request to be handled
+ *            request to be handled
      * @param idGenMode
+     * @param allowFeatureReferencesToDatastore
      */
     TransactionHandler( WebFeatureService master, WfsFeatureStoreManager service, Transaction request,
-                        IDGenMode idGenMode ) {
+                        IDGenMode idGenMode, boolean allowFeatureReferencesToDatastore ) {
         this.master = master;
         this.service = service;
         this.request = request;
         this.idGenMode = idGenMode;
+        this.allowFeatureReferencesToDatastore = allowFeatureReferencesToDatastore;
     }
 
     /**
@@ -407,6 +414,14 @@ class TransactionHandler {
             for ( String newFid : newFids ) {
                 inserted.add( newFid, insert.getHandle() );
             }
+        } catch ( XMLParsingException e ) {
+            String exceptionCode = INVALID_PARAMETER_VALUE;
+            if ( VERSION_200.equals( request.getVersion() ) ) {
+                exceptionCode = OWSException.INVALID_VALUE;
+            }
+            LOG.debug( e.getMessage(), e );
+            String msg = "Cannot perform insert operation: " + e.getMessage();
+            throw new OWSException( msg, exceptionCode );
         } catch ( Exception e ) {
             LOG.debug( e.getMessage(), e );
             String msg = "Cannot perform insert operation: " + e.getMessage();
@@ -416,16 +431,22 @@ class TransactionHandler {
 
     private FeatureCollection parseFeaturesOrCollection( XMLStreamReader xmlStream, GMLVersion inputFormat,
                                                          ICRS defaultCRS )
-                            throws XMLStreamException, XMLParsingException, UnknownCRSException,
-                            ReferenceResolvingException {
+                                                                                 throws XMLStreamException,
+                                                                                 XMLParsingException,
+                                                                                 UnknownCRSException,
+                                                                                 ReferenceResolvingException {
 
         FeatureCollection fc = null;
 
         // TODO determine correct schema
-        AppSchema schema = service.getStores()[0].getSchema();
+        FeatureStore featureStore = service.getStores()[0];
+        AppSchema schema = featureStore.getSchema();
         GMLStreamReader gmlStream = GMLInputFactory.createGMLStreamReader( inputFormat, xmlStream );
+        if ( allowFeatureReferencesToDatastore )
+            gmlStream.setInternalResolver( new FeatureStoreGMLIdResolver( featureStore ) );
         gmlStream.setApplicationSchema( schema );
         gmlStream.setDefaultCRS( defaultCRS );
+        gmlStream.setReferencePatternMatcher( master.getReferencePatternMatcher() );
 
         if ( new QName( WFS_NS, "FeatureCollection" ).equals( xmlStream.getName() ) ) {
             LOG.debug( "Features embedded in wfs:FeatureCollection" );
@@ -551,8 +572,9 @@ class TransactionHandler {
         }
     }
 
-    private Pair<QName, Integer> trySimpleMultiProp( Expr expr, FeatureType ft )
+    private Pair<QName, Integer> trySimpleMultiProp( ValueReference valueReference, FeatureType ft )
                             throws OWSException {
+        Expr expr = valueReference.getAsXPath();
         if ( !( expr instanceof LocationPath ) ) {
             throw new OWSException( "Cannot update property on feature type '" + ft.getName()
                                     + "'. Complex property paths are not supported.", OPERATION_NOT_SUPPORTED );
@@ -576,8 +598,8 @@ class TransactionHandler {
         }
         NumberExpr ne = (NumberExpr) expr;
         int index = Math.round( Float.parseFloat( ne.getText() ) );
-        return new Pair<QName, Integer>( new QName( ft.getName().getNamespaceURI(), namestep.getLocalName() ),
-                                         index - 1 );
+        String namespaceUri = determineNamespaceUri( valueReference, ft, namestep );
+        return new Pair<QName, Integer>( new QName( namespaceUri, namestep.getLocalName() ), index - 1 );
     }
 
     private List<ParsedPropertyReplacement> getReplacementProps( Update update, FeatureType ft, GMLVersion inputFormat )
@@ -590,14 +612,15 @@ class TransactionHandler {
             QName propName = replacement.getPropertyName().getAsQName();
             Pair<QName, Integer> simpleMultiProp = null;
             if ( propName == null ) {
-                simpleMultiProp = trySimpleMultiProp( replacement.getPropertyName().getAsXPath(), ft );
+                simpleMultiProp = trySimpleMultiProp( replacement.getPropertyName(), ft );
                 propName = simpleMultiProp.first;
             }
 
             PropertyType pt = ft.getPropertyDeclaration( propName );
             if ( pt == null ) {
                 throw new OWSException( "Cannot update property '" + propName + "' of feature type '" + ft.getName()
-                                        + "'. The feature type does not define this property.", OPERATION_NOT_SUPPORTED );
+                                        + "'. The feature type does not define this property.",
+                                        OPERATION_NOT_SUPPORTED );
             }
             XMLStreamReader xmlStream = replacement.getReplacementValue();
             int index = simpleMultiProp == null ? 0 : simpleMultiProp.second;
@@ -614,7 +637,8 @@ class TransactionHandler {
                     GMLFeatureReader featureReader = gmlReader.getFeatureReader();
 
                     ICRS crs = master.getDefaultQueryCrs();
-                    Property prop = featureReader.parseProperty( new XMLStreamReaderWrapper( xmlStream, null ), pt, crs );
+                    Property prop = featureReader.parseProperty( new XMLStreamReaderWrapper( xmlStream, null ), pt,
+                                                                 crs );
 
                     // TODO make this hack unnecessary
                     TypedObjectNode propValue = prop.getValue();
@@ -633,6 +657,9 @@ class TransactionHandler {
                     xmlStream.require( END_ELEMENT, null, "Property" );
                     // contract: skip to next ELEMENT_EVENT
                     xmlStream.nextTag();
+                } catch ( XMLParsingException e ) {
+                    LOG.debug( e.getMessage(), e );
+                    throw new OWSException( e.getMessage(), INVALID_VALUE );
                 } catch ( Exception e ) {
                     LOG.debug( e.getMessage(), e );
                     throw new OWSException( e.getMessage(), NO_APPLICABLE_CODE );
@@ -747,7 +774,6 @@ class TransactionHandler {
         xmlWriter.writeEndElement(); // wfs:Status
         xmlWriter.writeEndElement(); // wfs:TransactionResult
         xmlWriter.writeEndElement(); // wfs:WFS_TransactionResult
-        xmlWriter.writeEndDocument();
         xmlWriter.flush();
     }
 
@@ -804,7 +830,6 @@ class TransactionHandler {
         }
 
         xmlWriter.writeEndElement();
-        xmlWriter.writeEndDocument();
         xmlWriter.flush();
     }
 
@@ -833,7 +858,6 @@ class TransactionHandler {
         writeActionResults200( xmlWriter, "ReplaceResults", replaced );
 
         xmlWriter.writeEndElement();
-        xmlWriter.writeEndDocument();
         xmlWriter.flush();
     }
 
@@ -893,4 +917,15 @@ class TransactionHandler {
         }
         return gmlVersion;
     }
+
+    private String determineNamespaceUri( ValueReference valueReference, FeatureType ft, NameStep namestep ) {
+        String prefix = namestep.getPrefix();
+        if ( prefix != null && !"".equals( prefix ) ) {
+            String namespaceUriByPrefix = valueReference.getNsContext().getNamespaceURI( prefix );
+            if ( namespaceUriByPrefix != null && !"".equals( namespaceUriByPrefix ) )
+                return namespaceUriByPrefix;
+        }
+        return ft.getName().getNamespaceURI();
+    }
+
 }
